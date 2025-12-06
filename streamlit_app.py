@@ -1006,7 +1006,7 @@ if uploaded_bytes is not None:
     for _, r in df.iterrows():
         rm = str(r["No. RM"])
         # init state default (sekali)
-                st.session_state.per_patient.setdefault(rm, {
+        st.session_state.per_patient.setdefault(rm, {
             "visit": r["visit"],
             "gigi": r["gigi"],
             "telp": r["telp"],
