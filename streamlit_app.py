@@ -772,10 +772,6 @@ def _compute_rows_to_save(all_rows, reviewer_name):
         live_key = f"block_{rr['No. RM']}_{st_state.get('no', rr.get('No.', 0))}"
         live_text = st.session_state.get(live_key, st_state.get("block") or "")
         block_nonempty = bool(str(live_text).strip())
-        reviewed_ok = (
-            str(st_state.get("visit","")).lower().startswith("kunjungan")
-            and (str(st_state.get("telp","")).strip() != "" or str(st_state.get("operator","")).strip() != "")
-        )
         if block_nonempty:
             rows_to_save.append({
                 "rm": rm_key,
@@ -815,6 +811,7 @@ if uploaded_bytes is not None:
     per_str_db = per_date.strftime("%Y-%m-%d")
     supabase = get_supabase()
     review_map = load_review_map(supabase, per_str_db)
+    history_map = load_last_visit_map(supabase, per_str_db)
 
     # ==== Newer-list detection + precompute "belum direview" & anchors ====
     df_all = pd.DataFrame(rows).sort_values("No.")
@@ -1040,12 +1037,6 @@ if uploaded_bytes is not None:
             #  - belum pernah punya timestamp DB, atau
             #  - timestamp DB berubah dari terakhir kita tahu,
             # dan user belum mengubah textarea di sesi ini.
-                if "terjaring" in saved:
-                    state["is_terjaring"] = bool(saved.get("terjaring"))
-                if saved.get("diag_manual"):
-                    state["diag_manual"] = saved.get("diag_manual")
-                if saved.get("ga_tindakan"):
-                    state["ga_tindakan"] = saved.get("ga_tindakan")
             if (state["db_updated_at"] != db_ts) and (not state.get("manually_touched", False)):
                 # update form fields dari DB bila tersedia
                 if saved.get("visit"):
@@ -1059,6 +1050,13 @@ if uploaded_bytes is not None:
                 # update block text jika DB punya
                 if saved.get("block_text"):
                     state["block"] = saved["block_text"]
+                # Terjaring / Modalitas dari DB
+                if "terjaring" in saved:
+                    state["is_terjaring"] = bool(saved.get("terjaring"))
+                if saved.get("diag_manual"):
+                    state["diag_manual"] = saved.get("diag_manual")
+                if saved.get("ga_tindakan"):
+                    state["ga_tindakan"] = saved.get("ga_tindakan")
                 state["db_updated_at"] = db_ts
         # History: kunjungan terakhir sebelum hari ini
         hist = history_map.get(rm)
@@ -1169,8 +1167,8 @@ if uploaded_bytes is not None:
 
         # Recompute reviewed status AFTER inputs, then open wrapper and render preview
         auto_ok = (
-	str(state["visit"]).lower().startswith("kunjungan")
-    	and (str(state["telp"]).strip() != "" or str(state["operator"]).strip() != "")
+            str(state["visit"]).lower().startswith("kunjungan")
+            and (str(state["telp"]).strip() != "" or str(state["operator"]).strip() != "")
         )
 
         # jika belum lengkap: tutup wrapper & lanjut pasien berikutnya (tidak render textarea)
@@ -1398,7 +1396,7 @@ elif uploaded_bytes is None:
             per_str_db = per_date.strftime("%Y-%m-%d")
             supabase = get_supabase()
             review_map = load_review_map(supabase, per_str_db)
-    	    history_map = load_last_visit_map(supabase, per_str_db)
+            history_map = load_last_visit_map(supabase, per_str_db)
             blocks = [r.get("block_text","") for r in review_map.values() if (r.get("block_text") or "").strip()]
             if not blocks:
                 st.warning("Belum ada blok yang tersimpan untuk tanggal ini.")
