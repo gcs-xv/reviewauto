@@ -250,6 +250,38 @@ def normalize_visit(text: str) -> str:
             return k
     return t
 
+def parse_visit_number(text: str) -> int:
+    t = normalize_visit(text or "")
+    m = re.search(r"(\d+)", t)
+    if not m:
+        return 0
+    try:
+        n = int(m.group(1))
+    except ValueError:
+        return 0
+    return n if 1 <= n <= 5 else 0
+
+
+def next_visit_label(prev_visit: str) -> str:
+    n = parse_visit_number(prev_visit)
+    if n == 0:
+        return ""
+    n = 1 if n >= 5 else n + 1
+    return f"Kunjungan {n}"
+
+
+def int_to_roman(num: int) -> str:
+    if num <= 0:
+        return ""
+    vals = [100, 90, 50, 40, 10, 9, 5, 4, 1]
+    syms = ["C","XC","L","XL","X","IX","V","IV","I"]
+    res = ""
+    for v, s in zip(vals, syms):
+        while num >= v:
+            res += s
+            num -= v
+    return res
+
 # ===== Shared storage (Supabase) =====
 @st.cache_resource
 def get_supabase():
@@ -269,6 +301,32 @@ def load_review_map(supabase, periode_date: str):
         data = getattr(res, "data", None) or (res.get("data") if isinstance(res, dict) else []) or []
         # kembalikan dict by RM
         return {str(row.get("rm")): row for row in data}
+    except Exception:
+        return {}
+
+def load_last_visit_map(supabase, before_date: str):
+    """
+    Ambil kunjungan terakhir & meta (gigi/telp/operator, terjaring, dst) per RM
+    sebelum tanggal tertentu (before_date, format YYYY-MM-DD).
+    """
+    try:
+        res = (
+            supabase.table("reviews")
+            .select("periode_date, rm, visit, gigi, telp, operator, terjaring, diag_manual, ga_tindakan")
+            .lt("periode_date", before_date)
+            .order("periode_date", desc=True)
+            .execute()
+        )
+        rows = getattr(res, "data", None) or (res.get("data") if isinstance(res, dict) else []) or []
+        last = {}
+        for row in rows:
+            rm = str(row.get("rm") or "").strip()
+            if not rm:
+                continue
+            if rm in last:
+                continue
+            last[rm] = row
+        return last
     except Exception:
         return {}
 
@@ -294,6 +352,9 @@ def upsert_reviews(supabase, periode_date: str, file_name: str, rows_to_upsert: 
             "gigi": r.get("gigi"),
             "telp": r.get("telp"),
             "operator": r.get("operator"),
+            "terjaring": r.get("terjaring"),
+            "diag_manual": r.get("diag_manual"),
+            "ga_tindakan": r.get("ga_tindakan"),
         })
 
     try:
@@ -339,7 +400,7 @@ def upsert_summary(supabase, periode_date: str, summary_text: str):
         pass
 
 # =========================================================
-# Block Builder — logika baru impaksi / non-impaksi
+# Block Builder — logika impaksi / non-impaksi + Terjaring + POD dinamis
 # =========================================================
 def build_block_with_meta(no, row, visit_key, base_date):
     """
@@ -347,13 +408,17 @@ def build_block_with_meta(no, row, visit_key, base_date):
       - Diagnosa: kosong
       - Tindakan: Konsultasi + Periapikal X-ray gigi G / OPG
       - Kontrol : Pro <ekstraksi|odontektomi> gigi G (H+7 dari hari ini)
+
     Kunjungan 2:
       - Impaksi(..8): Diagnosa Impaksi..., Tindakan Odontektomi...
       - Non-impaksi : Diagnosa Gangren..., Tindakan Ekstraksi...
-      - Kontrol POD IV (base PERIODE)
+      - Kontrol POD III (base PERIODE)
+
     Kunjungan 3/4/5:
       - Diagnosa = POD {III|VII|XIV} {Ekstraksi|Odontektomi} gigi G
-      - Tindakan sesuai template; kontrol sesuai template (base PERIODE)
+        *POD disesuaikan dengan jarak hari dari kunjungan sebelumnya*
+      - Tindakan sesuai template
+      - Kontrol = POD VII / POD XIV, dan tanggalnya ikut menyesuaikan selisih POD
     """
     tpl_key = normalize_visit(visit_key or row.get("visit") or "(Pilih)")
     g_raw = (row.get("gigi") or "").strip()
@@ -367,12 +432,19 @@ def build_block_with_meta(no, row, visit_key, base_date):
     operator_in = str(row.get("operator") or "").strip()
     operator = _operator_prefixed(operator_in)
 
+    # Terjaring / Modalitas
+    is_terjaring = bool(row.get("terjaring"))
+    diag_manual = (row.get("diag_manual") or "").strip()
+    ga_tindakan = (row.get("ga_tindakan") or "").strip()
+
+    # Info kunjungan sebelumnya (untuk POD dinamis)
+    prev_visit = normalize_visit(row.get("prev_visit") or "")
+    prev_date = row.get("prev_date")  # diisi date atau None
+
     L = LABELS
     lines = []
 
-    # >>> HAPUS judul "Kunjungan X": tidak ditampilkan sesuai permintaan
-    # (jangan tambahkan baris tpl_key apa pun)
-
+    # Header
     lines.append(f"{no}. {L['nama']}{row['Nama']}")
     lines.append(f"{L['tgl']}{row['Tgl Lahir']}")
     lines.append(f"{L['rm']}{fmt_rm(row['No. RM'])}")
@@ -381,62 +453,167 @@ def build_block_with_meta(no, row, visit_key, base_date):
     diagnosa_txt = ""
     kontrol_txt = ""
 
-    if tpl_key == "Kunjungan 1":
-        diagnosa_txt = ""
-        tindakan_list = [
-            "Konsultasi",
-            f"Periapikal X-ray gigi {tooth} / OPG X-Ray",
-        ]
-        # H+7 dari hari ini
-        hplus = (date.today() + timedelta(days=7)).strftime("%d/%m/%Y")
-        op_lower = "odontektomi" if imp else "ekstraksi"
-        kontrol_txt = f"Pro {op_lower} gigi {tooth} dalam lokal anestesi ({hplus})"
+    TEMPLATE_POD = {
+        "Kunjungan 3": 3,
+        "Kunjungan 4": 7,
+        "Kunjungan 5": 14,
+    }
 
-    elif tpl_key == "Kunjungan 2":
-        if imp:
-            diagnosa_txt = f"Impaksi gigi {tooth} kelas xx posisi xx Mesioangular"
-            tindakan_list = [f"Odontektomi gigi {tooth} dalam lokal anestesi"]
+    def _base_pod_for_visit(v: str) -> int:
+        v = normalize_visit(v)
+        if v == "Kunjungan 2":
+            return 0
+        if v == "Kunjungan 3":
+            return 3
+        if v == "Kunjungan 4":
+            return 7
+        if v == "Kunjungan 5":
+            return 14
+        return 0
+
+    def _adjust_pod_for_current() -> int | None:
+        template_pod = TEMPLATE_POD.get(tpl_key)
+        if template_pod is None or not prev_date or not base_date or not prev_visit:
+            return None
+        prev_pod = _base_pod_for_visit(prev_visit)
+        days_gap = (base_date - prev_date).days
+        if days_gap <= 0:
+            return None
+        # Logika: POD hari ini = POD sebelumnya + selisih hari
+        # Contoh:
+        #  - K2 (POD 0) → K3 H+3 → POD III; H+4 → POD IV, dst.
+        #  - K3 (POD III) → K4 H+4 → POD VII; H+5 → POD VIII, dst.
+        cur_pod = prev_pod + days_gap
+        return cur_pod if cur_pod > 0 else None
+
+    # =========================
+    # 1) Terjaring / Modalitas
+    # =========================
+    if is_terjaring:
+        vnum = parse_visit_number(tpl_key)
+        diagnosa_txt = diag_manual
+
+        if vnum == 1:
+            tindakan_list = ["Konsultasi"]
+            bullets = [
+                "Pro Lab darah, CT,BT, GDS, HBsAg",
+                "Pro Thorax X-Ray",
+                "Pro konsul TS Anestesi",
+            ]
+            last = f"Pro {ga_tindakan or 'xx'} dalam general anestesi (menunggu penjadwalan)."
+            bullets.append(last)
+            kontrol_txt = "\n".join(f"* {b}" for b in bullets)
+
+        elif vnum == 2:
+            tindakan_list = [
+                "Lab darah, CT,BT, GDS, HBsAg",
+                "Thorax X-Ray",
+            ]
+            bullets = [
+                "Pro konsul TS Anestesi",
+                f"Pro {ga_tindakan or 'xx'} dalam general anestesi (menunggu penjadwalan).",
+            ]
+            kontrol_txt = "\n".join(f"* {b}" for b in bullets)
+
+        elif vnum == 3:
+            tindakan_list = ["Konsul TS Anestesi"]
+            bullets = [
+                f"Pro {ga_tindakan or 'xx'} dalam general anestesi (menunggu penjadwalan).",
+            ]
+            kontrol_txt = "\n".join(f"* {b}" for b in bullets)
+
         else:
-            diagnosa_txt = f"Gangren pulpa gigi {tooth} / Gangren radiks gigi {tooth}"
-            tindakan_list = [f"Ekstraksi gigi {tooth} dalam lokal anestesi"]
-        kontrol_txt = compute_kontrol_text("POD III (xx/04/2025)", diagnosa_txt, base_date)
+            # visit di luar 1–3: tetap pakai diagnosa manual, tanpa kontrol khusus
+            tindakan_list = []
+            kontrol_txt = ""
 
-    elif tpl_key == "Kunjungan 3":
-        diagnosa_txt = f"POD III {op_word} gigi {tooth} dalam lokal anestesi"
-        tindakan_list = ["Cuci luka intraoral dengan NaCl 0,9%"]
-        kontrol_txt = compute_kontrol_text("POD VII (xx/04/2025)", diagnosa_txt, base_date)
+    # =========================
+    # 2) Alur biasa (non Terjaring)
+    # =========================
+    if not is_terjaring:
+        if tpl_key == "Kunjungan 1":
+            diagnosa_txt = ""
+            tindakan_list = [
+                "Konsultasi",
+                f"Periapikal X-ray gigi {tooth} / OPG X-Ray",
+            ]
+            # H+7 dari hari ini
+            hplus = (date.today() + timedelta(days=7)).strftime("%d/%m/%Y")
+            op_lower = "odontektomi" if imp else "ekstraksi"
+            kontrol_txt = f"Pro {op_lower} gigi {tooth} dalam lokal anestesi ({hplus})"
 
-    elif tpl_key == "Kunjungan 4":
-        diagnosa_txt = f"POD VII {op_word} gigi {tooth} dalam lokal anestesi"
-        tindakan_list = ["Cuci luka intra oral dengan NaCl 0,9%", "Aff hecting"]
-        kontrol_txt = compute_kontrol_text("POD XIV (xx/04/2025)", diagnosa_txt, base_date)
+        elif tpl_key == "Kunjungan 2":
+            if imp:
+                diagnosa_txt = f"Impaksi gigi {tooth} kelas xx posisi xx Mesioangular"
+                tindakan_list = [f"Odontektomi gigi {tooth} dalam lokal anestesi"]
+            else:
+                diagnosa_txt = f"Gangren pulpa gigi {tooth} / Gangren radiks gigi {tooth}"
+                tindakan_list = [f"Ekstraksi gigi {tooth} dalam lokal anestesi"]
+            kontrol_txt = compute_kontrol_text("POD III (xx/04/2025)", diagnosa_txt, base_date)
 
-    elif tpl_key == "Kunjungan 5":
-        diagnosa_txt = f"POD XIV {op_word} gigi {tooth} dalam lokal anestesi"
-        tindakan_list = ["Kontrol luka post operasi", "Rujuk balik FKTP"]
-        kontrol_txt = "-"
+        elif tpl_key == "Kunjungan 3":
+            pod_cur = TEMPLATE_POD["Kunjungan 3"]
+            pod_adj = _adjust_pod_for_current()
+            if pod_adj:
+                pod_cur = pod_adj
+            pod_rom = int_to_roman(pod_cur)
+            diagnosa_txt = f"POD {pod_rom} {op_word} gigi {tooth} dalam lokal anestesi"
+            tindakan_list = ["Cuci luka intraoral dengan NaCl 0,9%"]
+            # Kontrol tetap "POD VII", date-nya nanti dihitung dari selisih POD
+            kontrol_txt = compute_kontrol_text("POD VII (xx/04/2025)", diagnosa_txt, base_date)
 
-    else:
-        # fallback ke template + filter impaksi utk non-8
-        tpl = VISIT_TEMPLATES.get(tpl_key, VISIT_TEMPLATES["(Pilih)"])
-        diagnosa = replace_gigi(tpl["diagnosa"], tooth)
-        tlist = [replace_gigi(t, tooth) for t in tpl["tindakan"]]
-        kontrol = replace_gigi(tpl["kontrol"], tooth)
-        diagnosa, tlist, kontrol = filter_for_tooth(diagnosa, tlist, kontrol, tooth)
-        diagnosa_txt = diagnosa
-        tindakan_list = tlist
-        kontrol_txt = compute_kontrol_text(kontrol, diagnosa_txt, base_date) if kontrol else ""
+        elif tpl_key == "Kunjungan 4":
+            pod_cur = TEMPLATE_POD["Kunjungan 4"]
+            pod_adj = _adjust_pod_for_current()
+            if pod_adj:
+                pod_cur = pod_adj
+            pod_rom = int_to_roman(pod_cur)
+            diagnosa_txt = f"POD {pod_rom} {op_word} gigi {tooth} dalam lokal anestesi"
+            tindakan_list = ["Cuci luka intra oral dengan NaCl 0,9%", "Aff hecting"]
+            # Kontrol tetap "POD XIV", date mengikuti selisih POD
+            kontrol_txt = compute_kontrol_text("POD XIV (xx/04/2025)", diagnosa_txt, base_date)
 
-    	# Jika gigi tidak diisi → kosongkan bagian terkait gigi,
-    	# tapi blok tetap ditampilkan agar bisa diedit manual.
-    if tooth == "xx":
+        elif tpl_key == "Kunjungan 5":
+            pod_cur = TEMPLATE_POD["Kunjungan 5"]
+            pod_adj = _adjust_pod_for_current()
+            if pod_adj:
+                pod_cur = pod_adj
+            pod_rom = int_to_roman(pod_cur)
+            diagnosa_txt = f"POD {pod_rom} {op_word} gigi {tooth} dalam lokal anestesi"
+            tindakan_list = ["Kontrol luka post operasi", "Rujuk balik FKTP"]
+            kontrol_txt = "-"
+
+        else:
+            # fallback ke template + filter impaksi utk non-8
+            tpl = VISIT_TEMPLATES.get(tpl_key, VISIT_TEMPLATES["(Pilih)"])
+            diagnosa = replace_gigi(tpl["diagnosa"], tooth)
+            tlist = [replace_gigi(t, tooth) for t in tpl["tindakan"]]
+            kontrol = replace_gigi(tpl["kontrol"], tooth)
+            diagnosa, tlist, kontrol = filter_for_tooth(diagnosa, tlist, kontrol, tooth)
+            diagnosa_txt = diagnosa
+            tindakan_list = tlist
+            kontrol_txt = compute_kontrol_text(kontrol, diagnosa_txt, base_date) if kontrol else ""
+
+    # Jika gigi tidak diisi → untuk non Terjaring, kosongkan bagian terkait gigi
+    if (tooth == "xx") and (not is_terjaring):
         diagnosa_txt = ""
         tindakan_list = []
         kontrol_txt = ""
 
-    lines.append(f"{L['diag']}{diagnosa_txt}")
+    # ===== Render Diagnosa =====
+    if is_terjaring and diagnosa_txt:
+        lines.append(f"{L['diag']}")
+        for ln in diagnosa_txt.splitlines():
+            line = ln.strip()
+            if not line:
+                continue
+            if not line.startswith("*"):
+                line = "* " + line
+            lines.append(f" {line}")
+    else:
+        lines.append(f"{L['diag']}{diagnosa_txt}")
 
-    # Jika hanya satu tindakan → tampil tanpa bullet; lebih dari satu → pakai bullet
+    # ===== Render Tindakan =====
     if len(tindakan_list) == 1:
         lines.append(f"{L['tind']}{tindakan_list[0]}")
     else:
@@ -444,7 +621,16 @@ def build_block_with_meta(no, row, visit_key, base_date):
         for t in tindakan_list:
             lines.append(f"    * {t}")
 
-    lines.append(f"{L['kont']}{kontrol_txt}")
+    # ===== Render Kontrol (bisa multi-line / bullet) =====
+    if "\n" in (kontrol_txt or ""):
+        k_lines = kontrol_txt.splitlines()
+        if k_lines:
+            lines.append(f"{L['kont']}{k_lines[0]}")
+            for ln in k_lines[1:]:
+                lines.append(f"  {ln}")
+    else:
+        lines.append(f"{L['kont']}{kontrol_txt}")
+
     lines.append(f"{L['dpjp']}{dpjp_full}")
     lines.append(f"{L['telp']}{telp}")
     lines.append(f"{L['opr']}{operator}")
@@ -590,7 +776,7 @@ def _compute_rows_to_save(all_rows, reviewer_name):
             str(st_state.get("visit","")).lower().startswith("kunjungan")
             and (str(st_state.get("telp","")).strip() != "" or str(st_state.get("operator","")).strip() != "")
         )
-        if block_nonempty:
+              if block_nonempty:
             rows_to_save.append({
                 "rm": rm_key,
                 "checked": True,
@@ -600,6 +786,9 @@ def _compute_rows_to_save(all_rows, reviewer_name):
                 "gigi": st_state.get("gigi"),
                 "telp": st_state.get("telp"),
                 "operator": st_state.get("operator"),
+                "terjaring": st_state.get("is_terjaring"),
+                "diag_manual": st_state.get("diag_manual"),
+                "ga_tindakan": st_state.get("ga_tindakan"),
             })
     return rows_to_save
 
@@ -817,7 +1006,7 @@ if uploaded_bytes is not None:
     for _, r in df.iterrows():
         rm = str(r["No. RM"])
         # init state default (sekali)
-        st.session_state.per_patient.setdefault(rm, {
+                st.session_state.per_patient.setdefault(rm, {
             "visit": r["visit"],
             "gigi": r["gigi"],
             "telp": r["telp"],
@@ -828,6 +1017,11 @@ if uploaded_bytes is not None:
             "dob": r["Tgl Lahir"],
             "dpjp_auto": r["DPJP (auto)"],
             "no": int(r["No."]),
+            "is_terjaring": False,
+            "diag_manual": "",
+            "ga_tindakan": "",
+            "prev_visit": None,
+            "prev_date": None,
         })
         state = st.session_state.per_patient[rm]
         patient_key = f"{rm}_{state['no']}"
@@ -846,6 +1040,12 @@ if uploaded_bytes is not None:
             #  - belum pernah punya timestamp DB, atau
             #  - timestamp DB berubah dari terakhir kita tahu,
             # dan user belum mengubah textarea di sesi ini.
+                if "terjaring" in saved:
+                    state["is_terjaring"] = bool(saved.get("terjaring"))
+                if saved.get("diag_manual"):
+                    state["diag_manual"] = saved.get("diag_manual")
+                if saved.get("ga_tindakan"):
+                    state["ga_tindakan"] = saved.get("ga_tindakan")
             if (state["db_updated_at"] != db_ts) and (not state.get("manually_touched", False)):
                 # update form fields dari DB bila tersedia
                 if saved.get("visit"):
@@ -860,6 +1060,56 @@ if uploaded_bytes is not None:
                 if saved.get("block_text"):
                     state["block"] = saved["block_text"]
                 state["db_updated_at"] = db_ts
+        # History: kunjungan terakhir sebelum hari ini
+        hist = history_map.get(rm)
+
+        # Simpan info kunjungan sebelumnya (buat logika POD dinamis)
+        if hist:
+            prev_visit_raw = hist.get("visit") or ""
+            state["prev_visit"] = normalize_visit(prev_visit_raw)
+            prev_date_str = hist.get("periode_date")
+            try:
+                state["prev_date"] = date.fromisoformat(prev_date_str) if prev_date_str else None
+            except Exception:
+                state["prev_date"] = None
+        else:
+            state["prev_visit"] = None
+            state["prev_date"] = None
+
+        # Autofill dari history HANYA jika:
+        # - belum ada data hari ini (saved is None)
+        # - dan user belum edit manual
+        if (not saved) and (not state.get("manually_touched", False)) and hist:
+            prev_visit = hist.get("visit") or ""
+            next_visit = next_visit_label(prev_visit)
+            if next_visit:
+                state["visit"] = next_visit
+
+            # copy gigi & telp dari kunjungan sebelumnya
+            if hist.get("gigi"):
+                state["gigi"] = hist.get("gigi")
+            if hist.get("telp"):
+                state["telp"] = hist.get("telp")
+
+            # aturan operator:
+            #  - jika prev kunjungan 1 → sekarang kunjungan 2 => operator dikosongkan
+            #  - jika prev kunjungan 2 → sekarang kunjungan 3 => operator dikosongkan
+            #  - lainnya: operator di-copy
+            prev_n = parse_visit_number(prev_visit)
+            if prev_n in (1, 2):
+                state["operator"] = ""
+            else:
+                if hist.get("operator"):
+                    state["operator"] = hist.get("operator")
+
+            # wariskan flag Terjaring & field manual kalau ada
+            if hist.get("terjaring"):
+                state["is_terjaring"] = bool(hist.get("terjaring"))
+            if hist.get("diag_manual"):
+                state["diag_manual"] = hist.get("diag_manual")
+            if hist.get("ga_tindakan"):
+                state["ga_tindakan"] = hist.get("ga_tindakan")
+
 
         # Reorder: header first
         wrap_style = "background-color:#e8f5e9;border:1px solid #2e7d32;border-radius:10px;padding:16px" if (
@@ -881,8 +1131,8 @@ if uploaded_bytes is not None:
             unsafe_allow_html=True
         )
 
-        # input mini, with clear button at end (now after header)
-        v1, v2, v3, v4 = st.columns([1,1,1,1])
+        # input mini, dengan checkbox Terjaring/Modalitas
+        v1, v2, v3, v4, v5 = st.columns([1,1,1,1,1])
         with v1:
             v_in = st.text_input("Kunjungan", value=state.get("visit",""), key=f"visit_{patient_key}")
             state["visit"] = normalize_visit(v_in)
@@ -895,6 +1145,27 @@ if uploaded_bytes is not None:
         with v4:
             o_in = st.text_input("Operator", value=state.get("operator",""), key=f"opr_{patient_key}")
             state["operator"] = o_in
+        with v5:
+            terj = st.checkbox("Terjaring/Modalitas", value=state.get("is_terjaring", False), key=f"terj_{patient_key}")
+            state["is_terjaring"] = terj
+
+        if state.get("is_terjaring"):
+            c1, c2 = st.columns([2,1])
+            with c1:
+                d_in = st.text_area(
+                    "Diagnosa (copas, 1 baris = 1 poin)",
+                    value=state.get("diag_manual", ""),
+                    key=f"diag_{patient_key}",
+                    height=100,
+                )
+                state["diag_manual"] = d_in
+            with c2:
+                ga_in = st.text_input(
+                    "Tindakan GA (isi untuk mengganti 'xx')",
+                    value=state.get("ga_tindakan", ""),
+                    key=f"ga_{patient_key}",
+                )
+                state["ga_tindakan"] = ga_in
 
         # Recompute reviewed status AFTER inputs, then open wrapper and render preview
         auto_ok = (
@@ -918,6 +1189,11 @@ if uploaded_bytes is not None:
             "gigi": state["gigi"],
             "telp": state["telp"],
             "operator": state["operator"],
+            "terjaring": state.get("is_terjaring"),
+            "diag_manual": state.get("diag_manual"),
+            "ga_tindakan": state.get("ga_tindakan"),
+            "prev_visit": state.get("prev_visit"),
+            "prev_date": state.get("prev_date"),
         }
         default_block, tind_list, konsul_flag = build_block_with_meta(
             state["no"], rdict, state["visit"], per_date
@@ -1122,6 +1398,7 @@ elif uploaded_bytes is None:
             per_str_db = per_date.strftime("%Y-%m-%d")
             supabase = get_supabase()
             review_map = load_review_map(supabase, per_str_db)
+    	    history_map = load_last_visit_map(supabase, per_str_db)
             blocks = [r.get("block_text","") for r in review_map.values() if (r.get("block_text") or "").strip()]
             if not blocks:
                 st.warning("Belum ada blok yang tersimpan untuk tanggal ini.")
