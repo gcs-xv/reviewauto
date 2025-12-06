@@ -776,7 +776,7 @@ def _compute_rows_to_save(all_rows, reviewer_name):
             str(st_state.get("visit","")).lower().startswith("kunjungan")
             and (str(st_state.get("telp","")).strip() != "" or str(st_state.get("operator","")).strip() != "")
         )
-              if block_nonempty:
+        if block_nonempty:
             rows_to_save.append({
                 "rm": rm_key,
                 "checked": True,
